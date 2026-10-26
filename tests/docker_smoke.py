@@ -79,6 +79,46 @@ def run(distro):
         def interfaces():
             data = json.loads(shell(client, 'ip -j addr show').stdout)
             return {d['ifname'] for d in data if d['ifname'].startswith('ppp') and any(a['family'] == 'inet' for a in d.get('addr_info', []))}
+
+        # Reproduce an old SysV service which reports stopped but leaves both
+        # the wildcard listener and an authenticated PPP session running.
+        before_accounts = shell(server, 'sha256sum /etc/ppp/chap-secrets').stdout
+        shell(server, 'systemctl stop l2tp-endpoints.target; systemctl unmask xl2tpd.service; mkdir -p /etc/systemd/system/xl2tpd.service.d')
+        override = '[Service]\nExecStop=\nExecStop=/bin/true\nKillMode=none\n'
+        shell(server, 'printf %s ' + shlex.quote(override) + ' > /etc/systemd/system/xl2tpd.service.d/fixture.conf')
+        shell(server, "sed -i '/^\\[global\\]/a force userspace = yes' /etc/xl2tpd/xl2tpd.conf; systemctl daemon-reload; systemctl start xl2tpd.service")
+        shell(client, "printf 'c a\\n' > /run/l2tp-client/control")
+        for _ in range(100):
+            if interfaces(): break
+            time.sleep(.1)
+        if not interfaces(): raise AssertionError('Legacy PPP fixture did not connect')
+        old_pids = shell(server, "pgrep -x xl2tpd; pgrep -x pppd").stdout.split()
+        if len(old_pids) < 2: raise AssertionError('Legacy fixture must contain daemon and live PPP')
+        shell(server, 'systemctl stop xl2tpd.service')
+        for pid in old_pids:
+            if shell(server, f'kill -0 {int(pid)}', check=False).returncode:
+                raise AssertionError('Legacy fixture did not leave orphan processes')
+        migrated = shell(server, 'bash /src/l2tp2.sh egress')
+        if shell(server, 'sha256sum /etc/ppp/chap-secrets').stdout != before_accounts:
+            raise AssertionError('Migration changed accounts, passwords or IP bindings')
+        listeners = shell(server, "ss -H -ulnp | grep ':9000'").stdout
+        if '0.0.0.0:9000' in listeners: raise AssertionError('Migration retained wildcard listener')
+        for pid in old_pids:
+            args = shell(server, f'cat /proc/{int(pid)}/cmdline', check=False).stdout
+            if 'xl2tpd' in args or 'pppd' in args: raise AssertionError('Migration retained an old process')
+        if shell(server, 'systemctl is-enabled xl2tpd.service', check=False).stdout.strip() != 'masked':
+            raise AssertionError('Legacy service not masked after migration')
+        report['checks'].append({'legacy_live_ppp_migration': 'passed', 'orphan_cleanup': 'passed', 'accounts_preserved': True})
+        report['migration'] = migrated.stdout
+        shell(client, "printf 'd a\\n' > /run/l2tp-client/control")
+        for _ in range(100):
+            if not interfaces(): break
+            time.sleep(.1)
+        if interfaces(): raise AssertionError('Legacy client PPP did not close')
+        # Verify enabled per-IP services can recover and dial after a service
+        # restart. This does not claim an independent kernel/VM reboot test.
+        shell(server, 'systemctl restart l2tp-endpoints.target')
+        report['checks'].append({'endpoint_service_restart': 'passed'})
         for name, ingress, user in lacs:
             before = interfaces()
             shell(client, f"printf 'c {name}\\n' > /run/l2tp-client/control")
@@ -95,6 +135,12 @@ def run(distro):
             expected = '118.107.221.60' if user == 'fixed60' else '118.107.221.61'
             if actual != expected: raise AssertionError(f'{name}: ingress={ingress}, user={user}, expected={expected}, actual={actual}')
             report['checks'].append(dict(user=user, ingress=ingress, expected_egress=expected, observed_egress=actual, interface=interface))
+        server_addresses = json.loads(shell(server, 'ip -j -4 addr show').stdout)
+        peers = [a.get('peer', a['local']) for d in server_addresses if d['ifname'].startswith('ppp')
+                 for a in d.get('addr_info', []) if a['family'] == 'inet']
+        if len(peers) != 4 or len(set(peers)) != 4:
+            raise AssertionError('Concurrent PPP client addresses are not unique: ' + repr(peers))
+        report['checks'].append({'concurrent_peer_addresses_unique': True, 'peer_addresses': peers})
         # The same account is already connected twice (a and b). Third login must be rejected.
         shell(client, "printf 'c e\\n' > /run/l2tp-client/control")
         rejected = False

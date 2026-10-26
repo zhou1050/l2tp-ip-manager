@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
-SCRIPT_VERSION='2026.10.26-admin3'
+SCRIPT_VERSION='2026.10.26-admin4'
 fail() {
     printf '[停止] %s\n' "$*" >&2
     if [[ -n ${BACKUP:-} ]]; then echo "备份目录：$BACKUP" >&2; fi
@@ -807,15 +807,66 @@ EGRESS
         chmod 700 "$hook"
     done
 }
+stop_old_l2tp() {
+    # SysV disable --now is not sufficient on every Debian/Ubuntu installation.
+    systemctl stop xl2tpd.service || fail '旧 xl2tpd 服务未能停止，未启动新入口。'
+    if [[ $(systemctl is-enabled xl2tpd.service 2>/dev/null || true) != masked ]]; then
+        systemctl disable xl2tpd.service || fail '无法禁用旧 xl2tpd 服务。'
+        systemctl mask xl2tpd.service || fail '无法屏蔽旧 xl2tpd 服务。'
+    fi
+    systemctl stop l2tp-endpoints.target || fail '无法停止现有入口，未切换配置。'
+    # A stopped SysV service may leave orphaned pppd children behind. Never kill
+    # all pppd/xl2tpd processes: match only this installer's configuration paths.
+    python3 - <<'PYSTOP'
+import os, pathlib, re, signal, time
+proc = pathlib.Path('/proc')
+def identity(pid):
+    try:
+        directory = proc / str(pid)
+        args = (directory / 'cmdline').read_bytes().rstrip(b'\0').split(b'\0')
+        args = [a.decode(errors='replace') for a in args]
+        if not args: return None
+        name = pathlib.PurePath(args[0]).name
+        owned = False
+        if name == 'pppd':
+            owned = any(a == 'file' and i + 1 < len(args) and
+                        (args[i + 1] == '/etc/ppp/options.xl2tpd' or
+                         re.fullmatch(r'/etc/ppp/l2tp-endpoints/[0-9.]+\.options', args[i + 1]))
+                        for i, a in enumerate(args))
+        elif name == 'xl2tpd':
+            config = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == '-c'), None)
+            owned = config in (None, '/etc/xl2tpd/xl2tpd.conf')
+        if not owned: return None
+        return (directory / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError): return None
+def scan():
+    return {int(p.name): token for p in proc.iterdir()
+            if p.name.isdigit() and (token := identity(int(p.name))) is not None}
+targets = scan()
+for sig, timeout in [(signal.SIGTERM, 6), (signal.SIGKILL, 2)]:
+    for pid, token in targets.items():
+        if identity(pid) == token:
+            try: os.kill(pid, sig)
+            except ProcessLookupError: pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(identity(pid) == token for pid, token in targets.items()): break
+        time.sleep(.1)
+if scan(): raise SystemExit('仍有旧 L2TP/PPP 进程，已停止启动新入口，请检查进程和服务。')
+PYSTOP
+}
 start_endpoints() {
     local port=$1 ingress subnet local_ip pool attempt missing sockets
     STEP='启动入口 IP 对应的独立监听与出口'
     systemctl daemon-reload
     # The old wildcard listener must release the UDP port before per-IP listeners start.
-    systemctl disable --now xl2tpd.service
-    systemctl stop l2tp-endpoints.target || true
+    stop_old_l2tp
+    # No managed PPP session remains. Clear stale per-session rules left by
+    # interrupted down hooks before allowing any new address allocation.
     systemctl enable l2tp-firewall.service l2tp-endpoints.target
     systemctl restart l2tp-firewall.service
+    iptables -w -t nat -F L2TP_PURE_SNAT
+    iptables -w -F L2TP_PURE_SESSION
     systemctl start l2tp-endpoints.target
     for attempt in 1 2 3 4 5; do
         missing=0

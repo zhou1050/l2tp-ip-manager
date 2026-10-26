@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -111,10 +112,13 @@ class ShellTests(unittest.TestCase):
             fixture = posix(root)
             # Redirect every generated /etc and libexec path into a temporary fixture.
             script = SOURCE.replace('/etc/', fixture + '/etc/').replace('/usr/local/libexec', fixture + '/libexec').replace('/run/l2tp-pure', fixture + '/run/l2tp-pure')
+            script = script.replace("pathlib.Path('/proc')", "pathlib.Path('" + root.as_posix() + "/proc')")
+            script = script.replace("python3 - <<'PYSTOP'", shlex.quote(sys.executable.replace('\\', '/')) + " - <<'PYSTOP'")
+            if os.name == 'nt': script = script.replace('signal.SIGKILL', '9')
             binpath = posix(Path(BASH).parent)
             script = re.sub(r'^export PATH=.*$', 'export PATH=' + binpath + ':$PATH', script, flags=re.M)
             (root / 'installer.sh').write_text(script, encoding='utf-8', newline='\n')
-            for path in ['etc/ppp', 'etc/systemd/system', 'etc/xl2tpd', 'libexec']:
+            for path in ['etc/ppp', 'etc/systemd/system', 'etc/xl2tpd', 'libexec', 'proc']:
                 (root / path).mkdir(parents=True)
             (root / 'etc/ppp/options.xl2tpd').write_text('auth\nrequire-mschap-v2\nipcp-accept-remote\nipparam l2tp-pure\n', encoding='utf-8', newline='\n')
             (root / 'etc/ppp/chap-secrets').write_text('"hka1" l2tpd "fixture-secret" *\n', encoding='utf-8', newline='\n')
@@ -181,7 +185,9 @@ migrate_egress
             self.assertNotIn(' -f', journal[0])
             self.assertTrue(journal[1].endswith(' -f'))
             self.assertEqual((root / 'etc/ppp/chap-secrets').read_text(), '"hka1" l2tpd "fixture-secret" *\n')
-            self.assertIn('disable --now xl2tpd.service', (root / 'systemctl.log').read_text())
+            services = (root / 'systemctl.log').read_text()
+            self.assertIn('stop xl2tpd.service', services)
+            self.assertIn('mask xl2tpd.service', services)
 
 
 if __name__ == '__main__':
