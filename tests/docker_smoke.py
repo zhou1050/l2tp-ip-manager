@@ -115,6 +115,19 @@ def run(distro):
             if not interfaces(): break
             time.sleep(.1)
         if interfaces(): raise AssertionError('Legacy client PPP did not close')
+        # Rebuild the client tunnel after the old server has been forcibly
+        # removed. Reusing its stale tunnel ID only tests xl2tpd retry timeout,
+        # not a new dial attempt against the migrated service.
+        shell(client, 'pkill -TERM -x xl2tpd || true')
+        for _ in range(100):
+            if not shell(client, "ss -H -ulnp | grep ':1702'", check=False).stdout: break
+            time.sleep(.1)
+        else: raise AssertionError('Legacy client listener did not stop')
+        shell(client, 'rm -f /run/l2tp-client/control /run/l2tp-client/pid')
+        background(client, 'exec xl2tpd -D -c /tmp/client.conf -p /run/l2tp-client/pid -C /run/l2tp-client/control >> /tmp/client.log 2>&1')
+        for _ in range(30):
+            if shell(client, 'test -p /run/l2tp-client/control', check=False).returncode == 0: break
+            time.sleep(.1)
         # Verify enabled per-IP services can recover and dial after a service
         # restart. This does not claim an independent kernel/VM reboot test.
         shell(server, 'systemctl restart l2tp-endpoints.target')

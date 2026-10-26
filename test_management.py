@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import itertools
 import os
 from pathlib import Path
 import re
@@ -250,6 +251,41 @@ class AccountTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_action('batch-bind', '--prefix', 'hka', '--count', '3', '--ip-cycle', '118.107.221.60')
         self.assertEqual(self.secrets.read_bytes(), before)
+
+
+class LegacyProcessTests(unittest.TestCase):
+    def cleanup_case(self, ignore_term):
+        body = re.search(r"<<'PYSTOP'\n(.*?)\nPYSTOP", SOURCE, re.S).group(1)
+        body = body.replace("proc = pathlib.Path('/proc')", 'proc = ROOT')
+        if os.name == 'nt': body = body.replace('signal.SIGKILL', '9')
+        with tempfile.TemporaryDirectory(prefix='l2tp-process-test-') as td:
+            root = Path(td)
+            owned = {101: ['pppd', 'file', '/etc/ppp/options.xl2tpd'],
+                     102: ['/usr/sbin/pppd', 'file', '/etc/ppp/l2tp-endpoints/118.107.221.60.options'],
+                     103: ['/usr/sbin/xl2tpd', '-D']}
+            foreign = {201: ['pppd', 'file', '/etc/ppp/other.options'],
+                       202: ['xl2tpd', '-D', '-c', '/etc/other/xl2tpd.conf'],
+                       203: ['sleep', '100'],
+                       204: ['xl2tpd', '-D', '-c', '/etc/xl2tpd/endpoints/118.107.221.60.conf']}
+            for pid, args in {**owned, **foreign}.items():
+                p = root / str(pid); p.mkdir()
+                (p / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in args) + b'\0')
+                (p / 'stat').write_text(f'{pid} (process) ' + ' '.join(['S'] + ['0'] * 18 + [str(pid)]))
+            def kill(pid, sig):
+                self.assertIn(pid, owned, 'Cleanup tried to signal an unrelated process')
+                if not ignore_term or int(sig) == 9: (root / str(pid) / 'cmdline').unlink()
+            ticks = itertools.count()
+            with patch('os.kill', side_effect=kill) as signals, patch('time.sleep'), patch('time.monotonic', side_effect=lambda: next(ticks)):
+                exec(compile(body, 'isolated-stop-old', 'exec'), {'ROOT': root})
+            self.assertEqual(set(c.args[0] for c in signals.call_args_list), set(owned))
+            if ignore_term: self.assertTrue(any(int(c.args[1]) == 9 for c in signals.call_args_list))
+            for pid in foreign: self.assertTrue((root / str(pid) / 'cmdline').exists())
+
+    def test_cleanup_signals_only_owned_legacy_processes(self):
+        self.cleanup_case(False)
+
+    def test_stubborn_owned_processes_are_killed_after_grace_period(self):
+        self.cleanup_case(True)
 
 
 @unittest.skipUnless(BASH, 'Bash required')
