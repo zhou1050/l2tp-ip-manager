@@ -1,0 +1,41 @@
+name: Debian and Ubuntu PPP integration
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian12
+            base: debian:12-slim
+          - distro: debian13
+            base: debian:13-slim
+          - distro: ubuntu22
+            base: ubuntu:22.04
+          - distro: ubuntu24
+            base: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Prepare host PPP driver
+        run: |
+          sudo modprobe ppp_generic
+          sudo modprobe ppp_async
+          if [ ! -c /dev/ppp ]; then sudo mknod /dev/ppp c 108 0; fi
+      - name: Build distribution test image
+        run: docker build -f tests/Dockerfile --build-arg BASE=${{ matrix.base }} -t codex-l2tp-test:${{ matrix.distro }} .
+      - name: Install, dial, verify SNAT and uninstall
+        run: |
+          mkdir -p reports
+          python3 tests/docker_smoke.py ${{ matrix.distro }} --output reports/${{ matrix.distro }}.json
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: l2tp-${{ matrix.distro }}
+          path: reports/*.json
