@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
-SCRIPT_VERSION='2026.10.26-admin2'
+SCRIPT_VERSION='2026.10.26-admin3'
 fail() {
     printf '[停止] %s\n' "$*" >&2
     if [[ -n ${BACKUP:-} ]]; then echo "备份目录：$BACKUP" >&2; fi
@@ -286,6 +286,7 @@ Usage:
   bash l2tp2.sh account import|export --file PATH [--with-passwords]
   bash l2tp2.sh account bind --username hka1 --ip 118.107.221.60
   bash l2tp2.sh account batch-bind --prefix hka --count 60 --ip-start PUBLIC_IP
+  bash l2tp2.sh account batch-bind --prefix hka --count 245 --ip-cycle IP1,IP2,IP3
   bash l2tp2.sh account batch-add --prefix hka --count 60 --ip-file /root/ips.txt
   bash l2tp2.sh account kick --username NAME
   bash l2tp2.sh limit 2             # per-account concurrent limit; future logins
@@ -987,6 +988,7 @@ def main(argv):
     parser.add_argument('--disconnect', action='store_true')
     binding = parser.add_mutually_exclusive_group()
     binding.add_argument('--ip'); binding.add_argument('--ip-start'); binding.add_argument('--ip-file')
+    binding.add_argument('--ip-cycle', help='按输入顺序循环分配出口 IP，逗号或空格分隔')
     binding.add_argument('--clear-ip', action='store_true')
     args = parser.parse_args(argv)
     if not SECRETS.is_file(): raise ValueError('未找到账号配置，请先安装 L2TP')
@@ -1065,18 +1067,22 @@ def main(argv):
                 if action == 'add' and user in records: raise ValueError(f'账号已存在：{user}；整批未写入')
                 if action != 'add' and user not in records: raise ValueError(f'账号不存在：{user}；整批未写入')
             changed_bindings = {}
-            if args.ip or args.ip_start or args.ip_file or args.clear_ip:
+            if args.ip or args.ip_start or args.ip_file or args.ip_cycle is not None or args.clear_ip:
                 if action not in ('add', 'mod', 'bind'): raise ValueError('IP 参数只用于增加、修改或绑定账号')
                 if args.clear_ip: selected = [None] * len(targets)
                 elif args.ip: selected = [check_ip(args.ip)] * len(targets)
                 elif args.ip_start:
                     first = int(ipaddress.IPv4Address(args.ip_start))
                     selected = [check_ip(str(ipaddress.IPv4Address(first + i))) for i in range(len(targets))]
+                elif args.ip_cycle is not None:
+                    cycle = [check_ip(value) for value in re.split(r'[,\s]+', args.ip_cycle.strip()) if value]
+                    if not cycle: raise ValueError('循环出口 IP 列表不能为空')
+                    selected = [cycle[i % len(cycle)] for i in range(len(targets))]
                 else:
                     selected = [check_ip(row.strip()) for row in pathlib.Path(args.ip_file).read_text().splitlines() if row.strip()]
                     if len(selected) != len(targets): raise ValueError('IP 文件行数必须与账号数量一致')
                 changed_bindings = dict(zip(targets, selected))
-            elif action == 'bind': raise ValueError('绑定需要 --ip、--ip-start、--ip-file 或 --clear-ip')
+            elif action == 'bind': raise ValueError('绑定需要 --ip、--ip-start、--ip-file、--ip-cycle 或 --clear-ip')
             if args.new_name and (action != 'mod' or len(targets) != 1 or args.action.startswith('batch-')):
                 raise ValueError('--new-name 只支持单账号 mod')
             if args.new_name and (not USER.fullmatch(args.new_name) or (args.new_name in records and args.new_name != targets[0])):
@@ -1204,6 +1210,31 @@ uninstall_l2tp() {
     CONFIG_STARTED=0
     echo "卸载完成，备份保留于 $BACKUP。软件包、系统内核、其他账号/防火墙规则及当前系统转发开关未删除。"
 }
+batch_binding_menu() {
+    local prefix start count mode value disconnect
+    local -a args=(account batch-bind)
+    read -r -p '账号前缀 [hka]：' prefix || return
+    read -r -p '起始账号序号 [1]：' start || return
+    read -r -p '账号数量：' count || return
+    args+=(--prefix "${prefix:-hka}" --start "${start:-1}" --count "$count")
+    printf '分配方式：\n1 全部使用同一 IP\n2 IP 连续递增\n3 多个 IP 循环分配\n4 从文件逐行分配\n5 取消固定出口，跟随拨入 IP\n'
+    read -r -p '选择分配方式：' mode || return
+    case $mode in
+        1) read -r -p '固定出口 IP：' value || return; args+=(--ip "$value");;
+        2) read -r -p '起始出口 IP：' value || return; args+=(--ip-start "$value");;
+        3) read -r -p '循环出口 IP（按顺序填写，逗号或空格分隔）：' value || return; args+=(--ip-cycle "$value");;
+        4) read -r -p 'IP 文件完整路径：' value || return; args+=(--ip-file "$value");;
+        5) args+=(--clear-ip);;
+        *) echo '无效分配方式，未修改。'; return 1;;
+    esac
+    read -r -p '断开选中账号的已有连接，让客户端重拨生效？[y/N]：' disconnect || return
+    case $disconnect in
+        y|Y) args+=(--disconnect);;
+        ''|n|N) ;;
+        *) echo '无效选择，未修改。'; return 1;;
+    esac
+    if bash "${BASH_SOURCE[0]}" "${args[@]}"; then :; else warn '批量绑定未完成。'; return 1; fi
+}
 management_menu() {
     [[ -t 0 ]] || fail '交互菜单需要终端；非交互运行请使用明确子命令。'
     local choice action n
@@ -1227,10 +1258,12 @@ management_menu() {
                 fi
                 continue;;
             17) action='account kick';;
-            18|19)
-                read -r -p '固定出口 IP（批量时为起始 IP）：' n || return
-                if [[ $choice == 18 ]]; then action=bind; else action=batch-bind; fi
-                if bash "${BASH_SOURCE[0]}" account "$action" --ip-start "$n"; then :; else warn '绑定未完成。'; fi
+            18)
+                read -r -p '固定出口 IP：' n || return
+                if bash "${BASH_SOURCE[0]}" account bind --ip "$n"; then :; else warn '绑定未完成。'; fi
+                continue;;
+            19)
+                if batch_binding_menu; then :; else warn '操作未完成，请查看上方错误。'; fi
                 continue;;
             *) echo '无效选项'; continue;;
         esac

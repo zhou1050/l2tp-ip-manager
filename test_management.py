@@ -217,9 +217,71 @@ class AccountTests(unittest.TestCase):
         self.run_action('import', '--file', str(path))
         self.assertIn('# l2tp-egress=118.107.221.61', self.secrets.read_text())
 
+    def test_cycle_245_accounts_preserves_passwords_and_distributes_49_each(self):
+        ips = ['118.107.221.' + suffix for suffix in ['61', '67', '73', '74', '60']]
+        self.engine['ENDPOINTS'].write_text('\n'.join(ips), newline='\n')
+        self.run_action('batch-add', '--prefix', 'line', '--count', '245', '--password', 'unchanged')
+        self.run_action('batch-bind', '--prefix', 'line', '--count', '245', '--ip-cycle', ','.join(ips))
+        rows = self.rows()
+        lines = self.secrets.read_text().splitlines()
+        for i in range(1, 246):
+            self.assertEqual(rows[f'line{i}'][1][2], 'unchanged')
+            self.assertIn('# l2tp-egress=' + ips[(i - 1) % 5], lines[rows[f'line{i}'][0]])
+        for ip in ips:
+            self.assertEqual(self.secrets.read_text().count('# l2tp-egress=' + ip + '\n'), 49)
+        self.assertTrue(self.secrets.read_text().startswith(self.foreign))
+
+    def test_cycle_starts_from_first_ip_at_selected_account(self):
+        self.run_action('batch-add', '--prefix', 'line', '--start', '6', '--count', '3',
+                        '--password', 'pw', '--ip-cycle', '118.107.221.61, 118.107.221.60')
+        rows = self.rows()
+        for user, ip in [('line6', '61'), ('line7', '60'), ('line8', '61')]:
+            self.assertIn('# l2tp-egress=118.107.221.' + ip, self.secrets.read_text().splitlines()[rows[user][0]])
+
+    def test_invalid_cycle_or_missing_account_preserves_entire_batch(self):
+        self.run_action('add', '--username', 'hka2', '--password', 'pw')
+        before = self.secrets.read_bytes()
+        backups = set((self.root / 'backups').iterdir())
+        for cycle in ['', ' , ', '118.107.221.60,bad', '118.107.221.60,118.107.221.99']:
+            with self.subTest(cycle=cycle), self.assertRaises(ValueError):
+                self.run_action('batch-bind', '--prefix', 'hka', '--count', '2', '--ip-cycle', cycle)
+            self.assertEqual(self.secrets.read_bytes(), before)
+            self.assertEqual(set((self.root / 'backups').iterdir()), backups)
+        with self.assertRaises(ValueError):
+            self.run_action('batch-bind', '--prefix', 'hka', '--count', '3', '--ip-cycle', '118.107.221.60')
+        self.assertEqual(self.secrets.read_bytes(), before)
+
 
 @unittest.skipUnless(BASH, 'Bash required')
 class LifecycleTests(unittest.TestCase):
+    def test_batch_binding_menu_cycle_and_all_modes(self):
+        menu_source = SOURCE[SOURCE.index('batch_binding_menu() {'):SOURCE.index('management_menu() {')]
+        modes = [('1', '118.107.221.61', '--ip'),
+                 ('2', '118.107.221.60', '--ip-start'),
+                 ('3', '118.107.221.61,118.107.221.67,118.107.221.73,118.107.221.74,118.107.221.60', '--ip-cycle'),
+                 ('4', '/root/ips with spaces.txt', '--ip-file'), ('5', None, '--clear-ip')]
+        with tempfile.TemporaryDirectory(prefix='l2tp-menu-test-') as td:
+            root = Path(td)
+            capture = root / 'args.txt'
+            driver = root / 'driver.sh'
+            driver.write_text('set -Eeuo pipefail\n' + menu_source + '\n'
+                              + 'bash() { printf "%s\\n" "$@" > "' + posix(capture) + '"; }\n'
+                              + 'warn() { echo "$*" >&2; }\nbatch_binding_menu\n', encoding='utf-8', newline='\n')
+            for mode, value, flag in modes:
+                for disconnect in ['y', '']:
+                    with self.subTest(mode=mode, disconnect=disconnect):
+                        lines = ['hka', '1', '245', mode]
+                        if value is not None: lines.append(value)
+                        lines.append(disconnect)
+                        result = subprocess.run([BASH, str(driver)], input=('\n'.join(lines) + '\n').encode(),
+                                                capture_output=True)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        args = capture.read_text().splitlines()[1:]
+                        expected = ['account', 'batch-bind', '--prefix', 'hka', '--start', '1', '--count', '245', flag]
+                        if value is not None: expected.append(value)
+                        if disconnect: expected.append('--disconnect')
+                        self.assertEqual(args, expected)
+
     def test_connection_limit_updates_preserve_other_configuration(self):
         with tempfile.TemporaryDirectory(prefix='l2tp-limit-test-') as td:
             root = Path(td).resolve()
