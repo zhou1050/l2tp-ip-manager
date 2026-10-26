@@ -149,9 +149,9 @@ def run(distro):
             if actual != expected: raise AssertionError(f'{name}: ingress={ingress}, user={user}, expected={expected}, actual={actual}')
             report['checks'].append(dict(user=user, ingress=ingress, expected_egress=expected, observed_egress=actual, interface=interface))
         server_addresses = json.loads(shell(server, 'ip -j -4 addr show').stdout)
-        peers = [a.get('peer', a['local']) for d in server_addresses if d['ifname'].startswith('ppp')
+        peers = [a.get('address', a.get('peer')) for d in server_addresses if d['ifname'].startswith('ppp')
                  for a in d.get('addr_info', []) if a['family'] == 'inet']
-        if len(peers) != 4 or len(set(peers)) != 4:
+        if None in peers or len(peers) != 4 or len(set(peers)) != 4:
             raise AssertionError('Concurrent PPP client addresses are not unique: ' + repr(peers))
         report['checks'].append({'concurrent_peer_addresses_unique': True, 'peer_addresses': peers})
         # The same account is already connected twice (a and b). Third login must be rejected.
