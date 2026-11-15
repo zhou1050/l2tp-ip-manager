@@ -187,7 +187,7 @@ def run(distro):
             raise AssertionError('Keep-accounts uninstall removed accounts')
         report['checks'].append({'real_systemd_install': 'passed', 'real_uninstall_keep_accounts': 'passed'})
         report['uninstall'] = removed.stdout
-        shell(server, 'ip addr del 118.107.221.61/25 dev eth0; ip addr del 118.107.221.60/25 dev eth0')
+        shell(server, 'ip -4 addr flush dev eth0 to 118.107.221.0/25')
         shell(server, 'bash /src/l2tp2.sh install --port 9000 --username natfixture --password fixture-password --count 1 --max-connections 1')
         shell(server, f"ss -H -ulnp | grep -F '{server_ip}:9000'")
         before = interfaces()
