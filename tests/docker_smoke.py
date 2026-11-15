@@ -67,7 +67,7 @@ def run(distro):
         lacs = [('a', '118.107.221.61', 'fixed60'), ('b', '118.107.221.60', 'fixed60'),
                 ('c', '118.107.221.61', 'unbound'), ('d', '118.107.221.60', 'fixed61')]
         config = '[global]\nport = 1702\nforce userspace = yes\n'
-        for name, ingress, user in [*lacs, ('e', '118.107.221.61', 'fixed60')]:
+        for name, ingress, user in [*lacs, ('e', '118.107.221.61', 'fixed60'), ('nat', server_ip, 'natfixture')]:
             config += f'\n[lac {name}]\nlns = {ingress}:9000\npppoptfile = /tmp/client-{name}.options\nredial = no\n'
             options = f'noauth\nname {user}\npassword fixture-password\nrefuse-eap\nnoccp\nnoipv6\nmtu 1410\nmru 1410\nnodefaultroute\n'
             shell(client, 'printf %s ' + shlex.quote(options) + f' > /tmp/client-{name}.options')
@@ -187,6 +187,24 @@ def run(distro):
             raise AssertionError('Keep-accounts uninstall removed accounts')
         report['checks'].append({'real_systemd_install': 'passed', 'real_uninstall_keep_accounts': 'passed'})
         report['uninstall'] = removed.stdout
+        shell(server, 'ip addr del 118.107.221.61/25 dev eth0; ip addr del 118.107.221.60/25 dev eth0')
+        shell(server, 'bash /src/l2tp2.sh install --port 9000 --username natfixture --password fixture-password --count 1 --max-connections 1')
+        shell(server, f"ss -H -ulnp | grep -F '{server_ip}:9000'")
+        before = interfaces()
+        shell(client, "printf 'c nat\\n' > /run/l2tp-client/control")
+        for _ in range(100):
+            added = interfaces() - before
+            if added:
+                break
+            time.sleep(.1)
+        if not added:
+            raise AssertionError('Private IPv4 listener did not accept a PPP connection')
+        interface = sorted(added)[0]
+        shell(client, f'ip route replace {observer_ip}/32 dev {interface}')
+        actual = shell(client, f'curl --fail --silent --max-time 8 --interface {interface} http://{observer_ip}:18080/').stdout.strip()
+        if actual != server_ip:
+            raise AssertionError(f'Private IPv4 SNAT expected {server_ip}, observed {actual}')
+        report['checks'].append({'private_ipv4_listener_and_snat': 'passed', 'observed_egress': actual})
         report['result'] = 'passed'
     except Exception as e:
         report['result'] = 'failed'; report['error'] = str(e)

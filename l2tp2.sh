@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
-SCRIPT_VERSION='2026.11.16-ppp1'
+SCRIPT_VERSION='2026.11.16-nat1'
 PPP_KERNEL='6.1.0-54-cloud-amd64'
 PPP_DEBIAN_VERSION='6.1.190-1'
 fail() {
@@ -629,7 +629,7 @@ WantedBy=multi-user.target
 UNIT
 }
 plan_endpoints() {
-    STEP='检查入口公网 IP 与独立地址池'
+    STEP='检查本机入口 IPv4 与独立地址池'
     python3 - "$1" <<'PYPLAN'
 import ipaddress, json, subprocess, sys
 def read_ip(*args):
@@ -640,21 +640,37 @@ try:
                                     ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']):
         raise ValueError('地址池必须位于 RFC1918 私网')
     addresses = read_ip('addr', 'show')
-    endpoints, occupied = {}, []
+    private_nets = [ipaddress.IPv4Network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
+    endpoints, private_addresses, occupied = {}, {}, []
     for interface in addresses:
         name = interface['ifname']
         for a in interface.get('addr_info', []):
             ip = ipaddress.IPv4Address(a['local'])
-            if ip.is_global and a.get('scope') == 'global':
-                endpoints[str(ip)] = name
+            if a.get('scope') == 'global':
+                if ip.is_global:
+                    endpoints[str(ip)] = name
+                elif any(ip in net for net in private_nets):
+                    private_addresses.setdefault(name, []).append(str(ip))
             if name != 'lo' and not name.startswith('ppp'):
                 occupied.append(ipaddress.IPv4Network(f"{ip}/{a['prefixlen']}", strict=False))
+    defaults = read_ip('route', 'show', 'default')
+    if len(defaults) != 1 or not defaults[0].get('dev'):
+        raise ValueError('需要唯一的 IPv4 默认出口网卡；多出口/策略路由需要单独整合')
+    default_dev = defaults[0]['dev']
     if not endpoints:
-        raise ValueError('未找到直接配置在本机的公网 IPv4；上游 NAT 的公网 IP 不能自动作为监听地址')
+        candidates = private_addresses.get(default_dev, [])
+        preferred = defaults[0].get('prefsrc')
+        if preferred in candidates:
+            ingress = preferred
+        elif len(candidates) == 1:
+            ingress = candidates[0]
+        else:
+            raise ValueError('默认出口网卡缺少可唯一确定的私网 IPv4，无法配置上游 NAT 模式')
+        endpoints[ingress] = default_dev
+        print(f'[提示] 使用本机私网 IPv4 {ingress} 监听及 SNAT；公网拨号需由云平台映射到此地址。', file=sys.stderr)
     if len(endpoints) > 256:
         raise ValueError('本模式最多支持 256 个入口 IP')
-    defaults = read_ip('route', 'show', 'default')
-    if len(defaults) != 1 or not defaults[0].get('dev') or set(endpoints.values()) != {defaults[0]['dev']}:
+    if set(endpoints.values()) != {default_dev}:
         raise ValueError('仅支持同一默认出口网卡上的公网 IP；多出口/策略路由需要单独整合')
     for route in read_ip('route', 'show', 'table', 'main'):
         if route.get('dst', 'default') == 'default' or route.get('dev', '').startswith('ppp'):
