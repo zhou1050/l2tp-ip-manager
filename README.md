@@ -12,6 +12,8 @@ bash sh.sh install
 bash sh.sh menu
 ```
 
+在 Debian 12 的 `6.1.0-54-cloud-amd64`（Debian `6.1.190-1`）上，如果系统无法加载 PPP 模块，安装脚本会尝试从对应的 [GitHub Release](https://github.com/zhou1050/l2tp-ip-manager/releases) 下载并校验模块。下载或校验失败时，脚本用 Debian 软件源中同版本的内核头文件和源码在服务器上编译。模块安装后仍须通过 PPP 设备检查。
+
 旧版安装保留账号升级使用 `bash sh.sh egress`，切换会断开现有拨号；`install` 会重建本脚本账号。
 
 最新版本 `2026.10.26-admin4`：将停止旧的默认 xl2tpd 服务并屏蔽其自动启动，等待及清理本脚本的残留 PPP 进程，清理失效会话规则后启动独立入口。旧安装上传新版后使用菜单 13 或 `egress` 应用，账号、密码、出口绑定保留，客户端需要重新拨号。

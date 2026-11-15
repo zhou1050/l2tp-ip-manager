@@ -1,0 +1,63 @@
+name: Build and verify cloud PPP modules
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build and boot the Debian cloud kernel to verify module loading
+        run: |
+          mkdir dist
+          docker run --rm -v "$PWD:/repo" -w /repo debian:12-slim bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends busybox-static cpio kmod qemu-system-x86 linux-image-6.1.0-54-cloud-amd64
+            bash -n sh.sh
+            bash -n l2tp2.sh
+            kernel=6.1.0-54-cloud-amd64
+            artifact="ppp-$kernel-6.1.190-1.tar.gz"
+            bash sh.sh ppp-build "/repo/dist/$artifact"
+            mkdir -p "/lib/modules/$kernel/updates/l2tp-ip-manager"
+            tar -xzf "dist/$artifact" -C "/lib/modules/$kernel/updates/l2tp-ip-manager"
+            depmod "$kernel"
+            mkdir -p /tmp/guest/{bin,dev,proc,sys}
+            cp /bin/busybox /tmp/guest/bin/
+            ln -s busybox /tmp/guest/bin/sh
+            set -o pipefail
+            { modprobe -S "$kernel" --show-depends ppp_generic; modprobe -S "$kernel" --show-depends ppp_async; } | awk "!seen[\$0]++" | while read -r action path rest; do
+              if [[ $action == insmod ]]; then
+                cp "$path" "/tmp/guest/${path##*/}"
+                printf "/bin/busybox insmod /%s || exit 1\n" "${path##*/}"
+              fi
+            done > /tmp/guest/load
+            cat > /tmp/guest/init <<'\''EOF'\''
+          #!/bin/sh
+          /bin/busybox mount -t devtmpfs devtmpfs /dev
+          /bin/busybox mount -t proc proc /proc
+          if [ "$(/bin/busybox uname -r)" = 6.1.0-54-cloud-amd64 ] && /bin/sh /load; then
+            [ -c /dev/ppp ] || /bin/busybox mknod /dev/ppp c 108 0
+            if (exec 9</dev/ppp); then echo CLOUD_PPP_VERIFIED; fi
+          fi
+          /bin/busybox poweroff -f
+          EOF
+            chmod +x /tmp/guest/init
+            (cd /tmp/guest && find . | cpio -o -H newc | gzip) > /tmp/guest.img
+            timeout 120 qemu-system-x86_64 -m 512 -nographic -no-reboot \
+              -kernel "/boot/vmlinuz-$kernel" -initrd /tmp/guest.img -append "console=ttyS0 panic=-1" > /tmp/boot.log
+            cat /tmp/boot.log
+            grep -qx CLOUD_PPP_VERIFIED < <(tr -d "\r" </tmp/boot.log)
+            (cd dist && sha256sum "$artifact" > "$artifact.sha256")
+            chmod a+r "dist/$artifact" "dist/$artifact.sha256"
+          '
+      - name: Publish the tested files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(bash sh.sh --version)"
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
+            --notes 'PPP modules tested on Debian 12 6.1.0-54-cloud-amd64 (6.1.190-1) in QEMU.' \
+            sh.sh dist/*

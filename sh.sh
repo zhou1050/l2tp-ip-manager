@@ -3,7 +3,9 @@
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
-SCRIPT_VERSION='2026.10.26-admin4'
+SCRIPT_VERSION='2026.11.16-ppp1'
+PPP_KERNEL='6.1.0-54-cloud-amd64'
+PPP_DEBIAN_VERSION='6.1.190-1'
 fail() {
     printf '[停止] %s\n' "$*" >&2
     if [[ -n ${BACKUP:-} ]]; then echo "备份目录：$BACKUP" >&2; fi
@@ -136,12 +138,79 @@ ppp_guidance() {
         warn '安装与运行内核匹配、包含 CONFIG_PPP 和 CONFIG_PPP_ASYNC 的内核/模块包；必要时重启或联系系统管理员。'
     fi
 }
+build_ppp_modules() (
+    set -e
+    local work source build
+    work=$(mktemp -d)
+    trap 'rm -rf -- "$work"' EXIT
+    apt-get install -y --no-install-recommends build-essential xz-utils \
+        "linux-headers-$PPP_KERNEL=$PPP_DEBIAN_VERSION" \
+        "linux-source-6.1=$PPP_DEBIAN_VERSION"
+    source=/usr/src/linux-source-6.1.tar.xz
+    build=/lib/modules/$PPP_KERNEL/build
+    tar -xJf "$source" -C "$work" --strip-components=4 \
+        linux-source-6.1/drivers/net/ppp/ppp_generic.c \
+        linux-source-6.1/drivers/net/ppp/ppp_async.c
+    printf 'obj-m := ppp_generic.o ppp_async.o\n' > "$work/Makefile"
+    if ! grep -qw slhc_init "$build/Module.symvers"; then
+        tar -xJf "$source" -C "$work" --strip-components=4 linux-source-6.1/drivers/net/slip/slhc.c
+        echo 'obj-m += slhc.o' >> "$work/Makefile"
+    fi
+    make -C "$build" M="$work" modules
+    local -a modules=(ppp_generic.ko ppp_async.ko)
+    if [[ -f $work/slhc.ko ]]; then modules+=(slhc.ko); fi
+    tar -czf "$1" -C "$work" "${modules[@]}"
+)
+
+recover_ppp_modules() {
+    [[ $(uname -r) == "$PPP_KERNEL" ]] || return 1
+    grep -Fq "Debian $PPP_DEBIAN_VERSION " /proc/version || return 1
+    [[ $(dpkg --print-architecture) == amd64 ]] || return 1
+    local work artifact url module vermagic
+    local -a modules=(ppp_generic.ko ppp_async.ko)
+    work=$(mktemp -d) || return 1
+    artifact="ppp-$PPP_KERNEL-$PPP_DEBIAN_VERSION.tar.gz"
+    url="https://github.com/zhou1050/l2tp-ip-manager/releases/download/v$SCRIPT_VERSION/$artifact"
+    if ! command -v curl >/dev/null; then
+        apt-get install -y --no-install-recommends curl ca-certificates || warn '无法安装下载工具。'
+    fi
+    if command -v curl >/dev/null && curl -fsSL --retry 2 --connect-timeout 10 --max-time 120 "$url" -o "$work/$artifact" &&
+        curl -fsSL --retry 2 --connect-timeout 10 --max-time 120 "$url.sha256" -o "$work/$artifact.sha256" &&
+        (cd "$work" && sha256sum -c "$artifact.sha256"); then
+        echo '已下载并校验 PPP 模块。'
+    else
+        warn '无法下载或校验 PPP 发布包，尝试使用匹配的 Debian 软件包本地编译。'
+        if ! bash "${BASH_SOURCE[0]}" ppp-build "$work/$artifact"; then
+            rm -rf -- "$work"
+            return 1
+        fi
+    fi
+    if tar -tzf "$work/$artifact" slhc.ko >/dev/null 2>&1; then modules+=(slhc.ko); fi
+    for module in "${modules[@]}"; do
+        if ! tar -xOzf "$work/$artifact" "$module" > "$work/$module" ||
+            ! vermagic=$(modinfo -F vermagic "$work/$module") || [[ ${vermagic%% *} != "$PPP_KERNEL" ]]; then
+            warn "PPP 发布包中的 $module 与运行内核不匹配。"
+            rm -rf -- "$work"
+            return 1
+        fi
+    done
+    if ! (cd "$work" && install -D -m 0644 -t "/lib/modules/$PPP_KERNEL/updates/l2tp-ip-manager" "${modules[@]}"); then
+        rm -rf -- "$work"
+        return 1
+    fi
+    rm -rf -- "$work"
+    depmod -a "$PPP_KERNEL" && modprobe ppp_generic && modprobe ppp_async
+}
+
 ensure_ppp_device() {
     STEP='检查 PPP 内核与设备'
     local generic_error='' async_error=''
     if command -v modprobe >/dev/null; then
         generic_error=$(modprobe ppp_generic 2>&1) || warn "$generic_error"
         async_error=$(modprobe ppp_async 2>&1) || warn "$async_error"
+        if [[ -n $generic_error || -n $async_error ]] && recover_ppp_modules; then
+            async_error=''
+        fi
     else warn '未找到 modprobe；将检查内置 PPP 驱动。'; fi
     if [[ ! -e /dev/ppp ]]; then
         if ! mknod /dev/ppp c 108 0; then ppp_guidance; fail '无法创建 /dev/ppp；检查设备权限。'; fi
@@ -1343,6 +1412,10 @@ case ${1:-install} in
     egress) migrate_egress;;
     check|--check) diagnose;;
     kernel|--install-kernel) kernel_install;;
+    ppp-build)
+        [[ $# == 2 && $2 == /* ]] || fail 'ppp-build 需要绝对输出路径。'
+        build_ppp_modules "$2"
+        ;;
     menu) management_menu;;
     account|accounts) shift; accounts "$@";;
     limit) shift; set_connection_limit "$@";;
