@@ -71,8 +71,19 @@ class PlannerTests(unittest.TestCase):
             '118.107.221.60\t192.168.18.0/24\t192.168.18.1\t192.168.18.2-192.168.18.254',
             '118.107.221.61\t192.168.19.0/24\t192.168.19.1\t192.168.19.2-192.168.19.254'])
 
-    def test_no_public_address_rejected(self):
-        self.assertNotEqual(self.plan(['10.0.0.2'])[0], 0)
+    def test_only_private_address_on_uplink(self):
+        rc, out, err = self.plan(['10.0.0.2'])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.split()[0], '10.0.0.2')
+
+    def test_private_uplink_uses_default_route_source(self):
+        rc, out, err = self.plan(['172.26.5.151', '172.26.5.152'],
+                                 defaults=[{'dev': 'eth1', 'prefsrc': '172.26.5.152'}])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.split()[0], '172.26.5.152')
+
+    def test_ambiguous_private_addresses_rejected(self):
+        self.assertNotEqual(self.plan(['10.0.0.2', '10.0.0.3'])[0], 0)
 
     def test_multiple_default_routes_rejected(self):
         self.assertNotEqual(self.plan(['61.15.33.10'], defaults=[{'dev': 'eth1'}, {'dev': 'eth2'}])[0], 0)
