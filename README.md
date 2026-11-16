@@ -4,12 +4,11 @@ Ubuntu / Debian 纯 L2TP 服务及账号管理脚本。支持多个入口 IP、�
 
 ## 开始使用
 
-将 `sh.sh` 上传到服务器，以 root 运行：
+在服务器上以 root 下载并运行 [当前发布版 v2026.11.16-nat1](https://github.com/zhou1050/l2tp-ip-manager/releases/tag/v2026.11.16-nat1)：
 
 ```bash
-bash sh.sh --version
-bash sh.sh install
-bash sh.sh menu
+curl -fL https://github.com/zhou1050/l2tp-ip-manager/releases/download/v2026.11.16-nat1/sh.sh -o sh-nat1.sh &&
+bash sh-nat1.sh install
 ```
 
 在 Debian 12 的 `6.1.0-54-cloud-amd64`（Debian `6.1.190-1`）上，如果系统无法加载 PPP 模块，安装脚本会尝试从对应的 [GitHub Release](https://github.com/zhou1050/l2tp-ip-manager/releases) 下载并校验模块。下载或校验失败时，脚本用 Debian 软件源中同版本的内核头文件和源码在服务器上编译。模块安装后仍须通过 PPP 设备检查。
@@ -18,7 +17,7 @@ bash sh.sh menu
 
 旧版安装保留账号升级使用 `bash sh.sh egress`，切换会断开现有拨号；`install` 会重建本脚本账号。
 
-最新版本 `2026.10.26-admin4`：将停止旧的默认 xl2tpd 服务并屏蔽其自动启动，等待及清理本脚本的残留 PPP 进程，清理失效会话规则后启动独立入口。旧安装上传新版后使用菜单 13 或 `egress` 应用，账号、密码、出口绑定保留，客户端需要重新拨号。
+安装和转发无需开启 BBR。
 
 ## 账号固定出口
 
@@ -68,7 +67,7 @@ bash sh.sh uninstall
 
 复测目标：Debian 12、Debian 13、Ubuntu 22.04 LTS、Ubuntu 24.04 LTS。自动化包含发行版软件包安装、systemd 实例启动、真实 PPP 拨号、跨入口固定出口、同账号并发拒绝、下线清理和卸载保留账号。详见 [测试报告](TEST_REPORT.md) 与 [完整使用说明](使用说明.md)。
 
-容器测试使用同一宿主机内核，不能代替不同云厂商网络、防护策略和独立内核版本的现场验证。需要 systemd、PPP 驱动及可用的本机公网 IPv4；多默认出口/上游 NAT 场景需要单独整合。纯 L2TP 不包含 IPsec 流量加密。
+容器测试覆盖公网 IPv4 和单默认出口的私网 IPv4 监听、拨号及 SNAT。云平台公网映射和防火墙仍需现场验证。运行需要 systemd 和 PPP 驱动。多默认出口或策略路由需要单独整合。纯 L2TP 不包含 IPsec 流量加密。
 
 在专用测试机上重跑：
 
